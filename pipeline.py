@@ -38,10 +38,15 @@ class MusicPipelineStage1:
         # Create download directory if it doesn't exist
         os.makedirs(download_dir, exist_ok=True)
 
-        # Initialize spotDL with Spotify credentials
+        # Initialize spotDL with Spotify credentials and output directory
         self.spotdl = Spotdl(
             client_id=spotify_client_id,
-            client_secret=spotify_client_secret
+            client_secret=spotify_client_secret,
+            downloader_settings={
+                'output': download_dir,
+                'format': 'mp3',
+                'threads': 4
+            }
         )
 
         self._init_database()
@@ -55,11 +60,12 @@ class MusicPipelineStage1:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 track_name TEXT NOT NULL,
                 artist TEXT NOT NULL,
-                spotify_url TEXT UNIQUE,
+                spotify_url TEXT,
                 local_path TEXT,
                 energy_level REAL,
                 genre TEXT,
-                added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                added_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(track_name, artist)
             )
         ''')
         conn.commit()
@@ -192,6 +198,59 @@ Remember: ONLY return the JSON array, nothing else."""
         conn.close()
         return result is not None, result
     
+    def find_downloaded_file(self, track_name, artist, wait_time=3):
+        """
+        Find a downloaded file in the download directory
+        
+        Args:
+            track_name: Name of the track
+            artist: Name of the artist
+            wait_time: How long to wait for file to appear (seconds)
+        
+        Returns:
+            Path to the file if found, None otherwise
+        """
+        # Wait a bit for file to be fully written
+        time.sleep(wait_time)
+        
+        # Get all audio files
+        audio_extensions = ('.mp3', '.m4a', '.opus', '.ogg', '.flac')
+        
+        # First, look for recently modified files (last 15 seconds)
+        recent_files = []
+        for filename in os.listdir(self.download_dir):
+            if filename.endswith(audio_extensions):
+                file_path = os.path.join(self.download_dir, filename)
+                file_time = os.path.getmtime(file_path)
+                
+                if time.time() - file_time < 15:
+                    recent_files.append((file_path, filename, file_time))
+        
+        # Sort by modification time (newest first)
+        recent_files.sort(key=lambda x: x[2], reverse=True)
+        
+        # Check recent files for matches
+        track_lower = track_name.lower()[:15]
+        artist_lower = artist.lower()[:15]
+        
+        for file_path, filename, _ in recent_files:
+            filename_lower = filename.lower()
+            if track_lower in filename_lower or artist_lower in filename_lower:
+                return file_path
+        
+        # If no recent match, return the most recent file
+        if recent_files:
+            return recent_files[0][0]
+        
+        # Last resort: any file matching the name
+        for filename in os.listdir(self.download_dir):
+            if filename.endswith(audio_extensions):
+                filename_lower = filename.lower()
+                if track_lower in filename_lower or artist_lower in filename_lower:
+                    return os.path.join(self.download_dir, filename)
+        
+        return None
+    
     def download_track(self, track_name, artist, spotify_url=None):
         """
         Download track using spotDL
@@ -215,47 +274,43 @@ Remember: ONLY return the JSON array, nothing else."""
             print(f"  Found: {song.name} by {song.artist}")
             
             # Check if already downloaded
-            for filename in os.listdir(self.download_dir):
-                if filename.endswith(('.mp3', '.m4a', '.opus', '.ogg')):
-                    # Loose matching - check if track name OR artist is in filename
-                    if (track_name.lower()[:10] in filename.lower() or 
-                        artist.lower()[:10] in filename.lower()):
-                        file_path = os.path.join(self.download_dir, filename)
-                        print(f"  File already exists: {filename}")
-                        return file_path
+            existing_file = self.find_downloaded_file(track_name, artist, wait_time=0)
+            if existing_file:
+                print(f"  File already exists: {os.path.basename(existing_file)}")
+                return existing_file
             
             # Download the song
             print(f"  Downloading...")
-            download_results, errors = self.spotdl.downloader.download_multiple_songs(search_results)
             
-            # Wait a moment for file to be written
-            time.sleep(1)
-            
-            # Find the newly downloaded file
-            for filename in os.listdir(self.download_dir):
-                if filename.endswith(('.mp3', '.m4a', '.opus', '.ogg')):
-                    file_path = os.path.join(self.download_dir, filename)
-                    file_time = os.path.getmtime(file_path)
+            try:
+                # Try the new API first (newer versions of spotdl)
+                result = self.spotdl.downloader.download_multiple_songs(search_results)
+                
+                # Handle different return types
+                if isinstance(result, tuple):
+                    download_results, errors = result
+                else:
+                    download_results = result
+                    errors = []
                     
-                    # If file was modified in last 10 seconds, it's probably our download
-                    if time.time() - file_time < 10:
-                        print(f"  Successfully downloaded: {filename}")
-                        return file_path
+            except Exception as download_error:
+                print(f"  Download error: {download_error}")
+                return None
             
-            # Fallback: return any matching file
-            for filename in os.listdir(self.download_dir):
-                if filename.endswith(('.mp3', '.m4a', '.opus', '.ogg')):
-                    if (track_name.lower()[:5] in filename.lower() or 
-                        artist.lower()[:5] in filename.lower()):
-                        file_path = os.path.join(self.download_dir, filename)
-                        print(f"  Found matching file: {filename}")
-                        return file_path
+            # Find the downloaded file
+            local_path = self.find_downloaded_file(track_name, artist, wait_time=3)
             
-            print(f"  Download completed but file not found")
-            return None
+            if local_path:
+                print(f"  Successfully downloaded: {os.path.basename(local_path)}")
+                return local_path
+            else:
+                print(f"  Download completed but file not found in {self.download_dir}")
+                return None
             
         except Exception as e:
             print(f"  Error downloading {track_name} by {artist}: {e}")
+            import traceback
+            traceback.print_exc()
             return None
     
     def add_track_to_db(self, track_name, artist, local_path, spotify_url=None, 
@@ -271,10 +326,17 @@ Remember: ONLY return the JSON array, nothing else."""
             ''', (track_name, artist, spotify_url, local_path, energy_level, genre))
             conn.commit()
             track_id = cursor.lastrowid
-            print(f"  Added to database (ID: {track_id})")
+            print(f"  ✓ Added to database (ID: {track_id})")
             return track_id
         except sqlite3.IntegrityError as e:
-            print(f"  Track already in database: {e}")
+            # Update existing record with new path
+            cursor.execute('''
+                UPDATE tracks 
+                SET local_path = ?, spotify_url = ?, energy_level = ?, genre = ?
+                WHERE track_name = ? AND artist = ?
+            ''', (local_path, spotify_url, energy_level, genre, track_name, artist))
+            conn.commit()
+            print(f"  ✓ Updated existing record in database")
             return None
         finally:
             conn.close()
@@ -290,16 +352,17 @@ Remember: ONLY return the JSON array, nothing else."""
             print(f"Error: {self.download_dir} folder not found")
             return
         
-        mp3_files = [f for f in os.listdir(self.download_dir) 
-                     if f.endswith(('.mp3', '.m4a', '.opus', '.ogg'))]
+        audio_extensions = ('.mp3', '.m4a', '.opus', '.ogg', '.flac')
+        audio_files = [f for f in os.listdir(self.download_dir) 
+                       if f.endswith(audio_extensions)]
         
-        print(f"Found {len(mp3_files)} audio files in {self.download_dir}/")
+        print(f"Found {len(audio_files)} audio files in {self.download_dir}/")
         print("-" * 60)
         
         added = 0
         skipped = 0
         
-        for filename in mp3_files:
+        for filename in audio_files:
             # Parse filename (usually "Artist - Track.mp3")
             name_without_ext = os.path.splitext(filename)[0]
             
@@ -330,7 +393,7 @@ Remember: ONLY return the JSON array, nothing else."""
         print("-" * 60)
         print(f"Added: {added} tracks")
         print(f"Skipped: {skipped} tracks (already in DB)")
-        print(f"Total in folder: {len(mp3_files)} tracks\n")
+        print(f"Total in folder: {len(audio_files)} tracks\n")
     
     def process_user_prompt(self, user_prompt):
         """
@@ -365,12 +428,12 @@ Remember: ONLY return the JSON array, nothing else."""
             # Check if in DB
             in_db, db_record = self.check_track_in_db(track_name, artist)
             
-            if in_db:
+            if in_db and db_record[4]:  # db_record[4] is local_path
                 print(f"  ✓ Found in database")
                 processed_tracks.append({
                     'track_name': track_name,
                     'artist': artist,
-                    'local_path': db_record[4],  # local_path column
+                    'local_path': db_record[4],
                     'energy_level': track.get('energy_level'),
                     'genre': track.get('genre'),
                     'source': 'database'
@@ -402,14 +465,15 @@ Remember: ONLY return the JSON array, nothing else."""
                         'genre': track.get('genre'),
                         'source': 'downloaded'
                     })
+                    print(f"  ✓ Track ready for processing")
                 else:
-                    print(f"  ✗ Download failed")
+                    print(f"  ✗ Download failed - skipping this track")
             
             print()  # Empty line for readability
         
         print(f"{'='*60}")
         print(f"PIPELINE STAGE 1 COMPLETE!")
-        print(f"Processed {len(processed_tracks)} tracks successfully")
+        print(f"Processed {len(processed_tracks)}/{len(suggested_tracks)} tracks successfully")
         print(f"Audio files stored in: {self.download_dir}/")
         print(f"Database stored at: {self.db_path}")
         print(f"{'='*60}\n")
@@ -448,11 +512,11 @@ Remember: ONLY return the JSON array, nothing else."""
 
 if __name__ == "__main__":
     # Configuration
-    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyC_g4y4AnxW13_JoyPFuLXcS23oaWdgx7g")
-    SPOTIFY_CLIENT_ID = "9e04c40b14e14a8aad50fda3d0f01913"
-    SPOTIFY_CLIENT_SECRET = "2daadce09a2345bd82013ada0c1dc216"
+    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "YOUR_API_KEY_HERE")
+    SPOTIFY_CLIENT_ID = "YOUR_SPOTIFY_CLIENT_ID"
+    SPOTIFY_CLIENT_SECRET = "YOUR_SPOTIFY_CLIENT_SECRET"
     
-    if not GEMINI_API_KEY:
+    if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_API_KEY_HERE":
         print("ERROR: GEMINI_API_KEY not set!")
         print("Set it with: export GEMINI_API_KEY='your_key'")
         exit(1)
